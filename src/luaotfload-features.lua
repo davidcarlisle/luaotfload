@@ -6,7 +6,8 @@ if not modules then modules = { } end modules ["features"] = {
     license   = "see context related readme files"
 }
 
-local type, next        = type, next
+local type              = type
+local next              = next
 local tonumber          = tonumber
 local tostring          = tostring
 
@@ -15,6 +16,11 @@ local lpegmatch         = lpeg.match
 local P                 = lpeg.P
 local R                 = lpeg.R
 local C                 = lpeg.C
+
+local table             = table
+local tabletohash       = table.tohash
+local setmetatableindex = table.setmetatableindex
+local insert            = table.insert
 
 ---[[ begin included font-ltx.lua ]]
 --- this appears to be based in part on luatex-fonts-def.lua
@@ -755,7 +761,7 @@ local verbosebaselines = swapped(baselines)
 
 --doc]]--
 
-local support_incomplete = table.tohash({
+local support_incomplete = tabletohash({
     "deva", "beng", "guru", "gujr",
     "orya", "taml", "telu", "knda",
     "mlym", "sinh",
@@ -802,13 +808,13 @@ local set_default_features = function (speclist)
     end
     speclist.script = script
 
-    report("log", 0, "load",
+    report("log", 1, "load",
         "auto-selecting default features for script: %s",
         script)
 
     local requested = defaults[script]
     if not requested then
-        report("log", 0, "load",
+        report("log", 1, "load",
             "no defaults for script %q, falling back to \"dflt\"",
             script)
         requested = defaults.dflt
@@ -983,7 +989,6 @@ local report_otf          = logs.reporter("fonts","otf loading")
 
 local otf                 = fonts.handlers.otf
 local registerotffeature  = otf.features.register
-local setmetatableindex   = table.setmetatableindex
 
 --[[HH--
 
@@ -1039,6 +1044,7 @@ local function addfeature(data,feature,specifications)
                 local subtables     = specification.subtables or { specification.data } or { }
                 local featuretype   = types[specification.type or "substitution"]
                 local featureflags  = specification.flags or noflags
+                local featureorder  = specification.order or { feature }
                 local added         = false
                 local featurename   = stringformat("ctx_%s_%s",feature,s)
                 local st = { }
@@ -1099,17 +1105,23 @@ local function addfeature(data,feature,specifications)
                     -- script = { lang1, lang2, lang3 } or script = { lang1 = true, ... }
                     for k, v in next, askedfeatures do
                         if v[1] then
-                            askedfeatures[k] = table.tohash(v)
+                            askedfeatures[k] = tabletohash(v)
                         end
                     end
-                    sequences[#sequences+1] = {
+                    local sequence = {
                         chain     = 0,
                         features  = { [feature] = askedfeatures },
                         flags     = featureflags,
                         name      = featurename,
+                        order     = featureorder,
                         subtables = st,
                         type      = featuretype,
                     }
+                    if specification.prepend then
+                        insert(sequences,1,sequence)
+                    else
+                        insert(sequences,sequence)
+                    end
                     -- register in metadata (merge as there can be a few)
                     if not gsubfeatures then
                         gsubfeatures  = { }
@@ -1139,6 +1151,7 @@ local function addfeature(data,feature,specifications)
     end
 end
 
+
 otf.enhancers.addfeature = addfeature
 
 local extrafeatures = { }
@@ -1167,6 +1180,8 @@ local tlig = {
             [0x0060] = 0x2018,                   -- quoteright
         },
         flags     = { },
+        order     = { "tlig" },
+        prepend   = true,
     },
     {
         type     = "ligature",
@@ -1185,6 +1200,8 @@ local tlig = {
             [0x00BB] = {0x003E, 0x003E},         -- RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK
         },
         flags    = { },
+        order    = { "tlig" },
+        prepend  = true,
     },
     {
         type     = "ligature",
@@ -1196,6 +1213,8 @@ local tlig = {
             [0x00BF] = {0x003F, 0x0060},         -- questiondown
         },
         flags    = { },
+        order    = { "tlig" },
+        prepend  = true,
     },
 }
 
@@ -1247,6 +1266,7 @@ local anum_specification = {
         features = { arab = { far = true, urd = true, snd = true } },
         data     = anum_persian,
         flags    = { },
+        order    = { "anum" },
         valid    = valid,
     },
     {
@@ -1254,23 +1274,16 @@ local anum_specification = {
         features = { arab = { ["*"] = true } },
         data     = anum_arabic,
         flags    = { },
+        order    = { "anum" },
         valid    = valid,
     },
 }
 
---[[doc--
-
-    Below the specifications as given in the removed font-otc.lua.
-    The rest was identical to what this file had from the beginning.
-    Both make the “anum.tex” test pass anyways.
-
---doc]]--
-
-otf.addfeature("anum",anum_specification)
+otf.addfeature ("anum", anum_specification)
 
 registerotffeature {
-    name        = 'anum',
-    description = 'arabic digits',
+    name        = "anum",
+    description = "arabic digits",
 }
 
 -- vim:tw=71:sw=4:ts=4:expandtab

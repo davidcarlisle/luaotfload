@@ -119,23 +119,12 @@ local tablefastcopy            = table.fastcopy
 local tabletofile              = table.tofile
 local tabletohash              = table.tohash
 local tableserialize           = table.serialize
-local runasscript              = caches == nil
 --- the font loader namespace is “fonts”, same as in Context
 --- we need to put some fallbacks into place for when running
 --- as a script
 fonts                          = fonts          or { }
 fonts.names                    = fonts.names    or { }
 fonts.definers                 = fonts.definers or { }
-
-local luaotfloadconfig         = config.luaotfload --- always present
-luaotfloadconfig.resolver      = luaotfloadconfig.resolver or "normal"
-luaotfloadconfig.formats       = luaotfloadconfig.formats  or "otf,ttf,ttc,dfont"
-luaotfloadconfig.strip         = luaotfloadconfig.strip == true
-
---- this option allows for disabling updates
---- during a TeX run
-luaotfloadconfig.update_live   = luaotfloadconfig.update_live ~= false
-luaotfloadconfig.compress      = luaotfloadconfig.compress ~= false
 
 local names                    = fonts.names
 local name_index               = nil --> upvalue for names.data
@@ -144,44 +133,10 @@ names.version                  = 2.51
 names.data                     = nil      --- contains the loaded database
 names.lookups                  = nil      --- contains the lookup cache
 
-names.path                     = { index = { }, lookups = { } }
-names.path.globals             = {
-    prefix                     = "", --- writable_path/names_dir
-    names_dir                  = luaotfloadconfig.names_dir or "names",
-    index_file                 = luaotfloadconfig.index_file
-                              or "luaotfload-names.lua",
-    lookups_file               = "luaotfload-lookup-cache.lua",
-}
-
 --- string -> (string * string)
 local make_luanames = function (path)
     return filereplacesuffix(path, "lua"),
            filereplacesuffix(path, "luc")
-end
-
---- The “termwidth” value is only considered when printing
---- short status messages, e.g. when building the database
---- online.
-if not luaotfloadconfig.termwidth then
-    local tw = 79
-    if not (    os.type == "windows" --- Assume broken terminal.
-            or osgetenv "TERM" == "dumb")
-    then
-        local p = iopopen "tput cols"
-        if p then
-            result = tonumber (p:read "*all")
-            p:close ()
-            if result then
-                tw = result
-            else
-                report ("log", 2, "db", "tput returned non-number.")
-            end
-        else
-            report ("log", 2, "db", "Shell escape disabled or tput executable missing.")
-            report ("log", 2, "db", "Assuming 79 cols terminal width.")
-        end
-    end
-    luaotfloadconfig.termwidth = tw
 end
 
 local format_precedence = {
@@ -199,51 +154,9 @@ local set_location_precedence = function (precedence)
 end
 
 --[[doc--
-    We use the functions in the cache.* namespace that come with the
-    fontloader (see luat-basics-gen). it’s safe to use for the most part
-    since most checks and directory creations are already done. It
-    uses TEXMFCACHE or TEXMFVAR as starting points.
 
-    There is one quirk, though: ``getwritablepath()`` will always
-    assume that files in subdirectories of the cache tree are writable.
-    It gives no feedback at all if it fails to open a file in write
-    mode. This may cause trouble when the index or lookup cache were
-    created by different user.
---doc]]--
+    Auxiliary functions
 
-if not runasscript then
-    local globals   = names.path.globals
-    local names_dir = globals.names_dir
-
-    prefix = getwritablepath (names_dir, "")
-    if not prefix then
-        luaotfload.error
-            ("Impossible to find a suitable writeable cache...")
-    else
-        prefix = lpegmatch (stripslashes, prefix)
-        report ("log", 0, "db",
-                "Root cache directory is %s.", prefix)
-    end
-
-    globals.prefix     = prefix
-    local lookup_path  = names.path.lookups
-    local index        = names.path.index
-    local lookups_file = filejoin (prefix, globals.lookups_file)
-    local index_file   = filejoin (prefix, globals.index_file)
-    lookup_path.lua, lookup_path.luc = make_luanames (lookups_file)
-    index.lua, index.luc     = make_luanames (index_file)
-else --- running as script, inject some dummies
-    caches = { }
-    local dummy_function = function () end
-    log   = { report                = dummy_function,
-              report_status         = dummy_function,
-              report_status_start   = dummy_function,
-              report_status_stop    = dummy_function, }
-end
-
-
---[[doc--
-Auxiliary functions
 --doc]]--
 
 --- fontnames contain all kinds of garbage; as a precaution we
@@ -355,8 +268,10 @@ This is a sketch of the luaotfload db:
         optical : (int, int) list;  // design size -> index entry
     }
     and metadata = {
-        local       : bool;        (* set if local fonts were added to the db *)
+        created     : string       // creation time
         formats     : string list; // { "otf", "ttf", "ttc", "dfont" }
+        local       : bool;        (* set if local fonts were added to the db *)
+        modified    : string       // modification time
         statistics  : TODO;        // created when built with "--stats"
         version     : float;       // index version
     }
@@ -439,9 +354,10 @@ mtx-fonts has in names.tma:
 
 --doc]]--
 
---- string list -> dbobj
+--- string list -> string option -> dbobj
 
-local initialize_namedata = function (formats)
+local initialize_namedata = function (formats, created)
+    local now = os.date "%F %T"
     return {
         --families        = { },
         status          = { }, -- was: status; map abspath -> mapping
@@ -449,8 +365,10 @@ local initialize_namedata = function (formats)
         names           = { },
 --      files           = { }, -- created later
         meta            = {
-            ["local"]  = false,
+            created    = created or now,
             formats    = formats,
+            ["local"]  = false,
+            modified   = now,
             statistics = { },
             version    = names.version,
         },
@@ -534,6 +452,7 @@ local load_lua_file = function (path)
 end
 
 --- define locals in scope
+local access_font_index
 local collect_families
 local crude_file_lookup
 local crude_file_lookup_verbose
@@ -544,6 +463,7 @@ local get_font_filter
 local group_modifiers
 local load_lookups
 local load_names
+local getmetadata
 local order_design_sizes
 local ot_fullinfo
 local read_blacklist
@@ -566,11 +486,13 @@ local fuzzy_limit = 1 --- display closest only
 --- bool? -> dbobj
 load_names = function (dry_run)
     local starttime = osgettimeofday ()
-    local foundname, data = load_lua_file (names.path.index.lua)
+    local foundname, data = load_lua_file (config.luaotfload.paths.index_path_lua)
 
     if data then
-        report ("both", 2, "db",
-                "Font names database loaded", "%s", foundname)
+        report ("log", 0, "db",
+                "Font names database loaded from %s", foundname)
+        report ("term", 3, "db",
+                "Font names database loaded from %s", foundname)
         report ("info", 3, "db", "Loading took %0.f ms.",
                 1000 * (osgettimeofday () - starttime))
 
@@ -611,11 +533,29 @@ load_names = function (dry_run)
     return data
 end
 
+--[[doc--
+
+    access_font_index -- Provide a reference of the index table. Will
+    cause the index to be loaded if not present.
+
+--doc]]--
+
+access_font_index = function ()
+    if not name_index then name_index = load_names () end
+    return name_index
+end
+
+getmetadata = function ()
+    if not name_index then name_index = load_names() end
+    return tablefastcopy (name_index.meta)
+end
+
 --- unit -> unit
 load_lookups = function ( )
-    local foundname, data = load_lua_file(names.path.lookups.lua)
+    local foundname, data = load_lua_file(config.luaotfload.paths.lookup_path_lua)
     if data then
-        report("both", 3, "cache",
+        report("log", 0, "cache", "Lookup cache loaded from %s.", foundname)
+        report("term", 3, "cache",
                "Lookup cache loaded from %s.", foundname)
     else
         report("both", 1, "cache",
@@ -650,7 +590,7 @@ local style_category = {
     i           = "italic",
 }
 
-local type1_formats = { "tfm", "ofm", }
+local type1_metrics = { "tfm", "ofm", }
 
 local dummy_findfile = resolvers.findfile -- from basics-gen
 
@@ -692,11 +632,17 @@ crude_file_lookup_verbose = function (filename)
     end
 
     --- ofm and tfm, returns pair
-    for i=1, #type1_formats do
-        local format = type1_formats[i]
+    for i=1, #type1_metrics do
+        local format = type1_metrics[i]
         if resolvers.findfile(filename, format) then
             return file.addsuffix(filename, format), format, true
         end
+    end
+
+    if not fonts_reloaded and config.luaotfload.db.update_live == true then
+        return reload_db (stringformat ("File not found: %s.", filename),
+                          crude_file_lookup_verbose,
+                          filename)
     end
     return filename, nil, false
 end
@@ -748,13 +694,18 @@ crude_file_lookup = function (filename)
         return found, nil, true
     end
 
-    for i=1, #type1_formats do
-        local format = type1_formats[i]
+    for i=1, #type1_metrics do
+        local format = type1_metrics[i]
         if resolvers.findfile(filename, format) then
             return file.addsuffix(filename, format), format, true
         end
     end
 
+    if not fonts_reloaded and config.luaotfload.db.update_live == true then
+        return reload_db (stringformat ("File not found: %s.", filename),
+                          crude_file_lookup_verbose,
+                          filename)
+    end
     return filename, nil, false
 end
 
@@ -1171,8 +1122,9 @@ resolve_name = function (specification)
     end
 
     if not resolved then
-        if not fonts_reloaded then
-            return reload_db ("Font not found.",
+        if not fonts_reloaded and config.luaotfload.db.update_live == true then
+            return reload_db (stringformat ("Font %s not found.",
+                                            specification.name or "<?>"),
                               resolve_name,
                               specification)
         end
@@ -1213,7 +1165,7 @@ reload_db = function (why, caller, ...)
     local namedata  = name_index
     local formats   = tableconcat (namedata.meta.formats, ",")
 
-    report ("both", 1, "db",
+    report ("both", 0, "db",
             "Reload initiated (formats: %s); reason: %q.",
             formats, why)
 
@@ -1265,7 +1217,7 @@ find_closest = function (name, limit)
     if not name_index then name_index = load_names () end
     if not name_index or type (name_index) ~= "table" then
         if not fonts_reloaded then
-            return reload_db("no database", find_closest, name)
+            return reload_db("Font index missing.", find_closest, name)
         end
         return false
     end
@@ -2072,9 +2024,6 @@ do
     get_font_filter = function (formats)
         return tablefastcopy (current_formats)
     end
-
-    --- initialize
-    set_font_filter (luaotfloadconfig.formats)
 end
 
 local process_dir_tree
@@ -2177,7 +2126,7 @@ end
 --- indicates the number of characters already consumed on the
 --- line.
 local truncate_string = function (str, restrict)
-    local tw  = luaotfloadconfig.termwidth
+    local tw  = config.luaotfload.misc.termwidth
     local wd  = tw - restrict
     local len = utf8len (str)
     if wd - len < 0 then
@@ -2670,7 +2619,7 @@ local pull_values = function (entry)
     entry.splitstyle        = style.split
     entry.weight            = style.weight
 
-    if luaotfloadconfig.strip == true then
+    if config.luaotfload.db.strip == true then
         entry.file  = nil
         entry.names = nil
         entry.style = nil
@@ -2789,7 +2738,7 @@ end
 
 --[[doc--
 
-    add_bold_spectrum -- For not-quite-bold faces, determine whether
+    group_modifiers -- For not-quite-bold faces, determine whether
     they can fill in for a missing bold face slot in a matching family.
 
     Some families like Lucida do not contain real bold / bold italic
@@ -2931,12 +2880,12 @@ local collect_font_filenames = function ()
     report ("info", 4, "db", "Scanning the filesystem for font files.")
 
     local filenames = { }
-    local bisect    = luaotfloadconfig.bisect
-    local max_fonts = luaotfloadconfig.max_fonts or 2^51 --- XXX revisit for lua 5.3 wrt integers
+    local bisect    = config.luaotfload.misc.bisect
+    local max_fonts = config.luaotfload.db.max_fonts --- XXX revisit for lua 5.3 wrt integers
 
     tableappend (filenames, collect_font_filenames_texmf  ())
     tableappend (filenames, collect_font_filenames_system ())
-    if luaotfloadconfig.scan_local  == true then
+    if config.luaotfload.db.scan_local == true then
         tableappend (filenames, collect_font_filenames_local  ())
     end
     --- Now drop everything above max_fonts.
@@ -3175,7 +3124,7 @@ end
 update_names = function (currentnames, force, dry_run)
     local targetnames
 
-    if luaotfloadconfig.update_live == false then
+    if config.luaotfload.db.update_live == false then
         report ("info", 2, "db",
                 "Skipping database update.")
         --- skip all db updates
@@ -3192,7 +3141,7 @@ update_names = function (currentnames, force, dry_run)
     report("both", 1, "db", "Updating the font names database"
                          .. (force and " forcefully." or "."))
 
-    if luaotfloadconfig.skip_read == true then
+    if config.luaotfload.db.skip_read == true then
         --- the difference to a “dry run” is that we don’t search
         --- for font files entirely. we also ignore the “force”
         --- parameter since it concerns only the font files.
@@ -3214,7 +3163,8 @@ update_names = function (currentnames, force, dry_run)
             end
         end
 
-        targetnames = initialize_namedata (get_font_filter ())
+        targetnames = initialize_namedata (get_font_filter (),
+                                           currentnames.meta and currentnames.meta.created)
 
         read_blacklist ()
 
@@ -3234,7 +3184,7 @@ update_names = function (currentnames, force, dry_run)
     end
 
     --- pass 3 (optional): collect some stats about the raw font info
-    if luaotfloadconfig.statistics == true then
+    if config.luaotfload.misc.statistics == true then
         targetnames.meta.statistics = collect_statistics
                                             (targetnames.mappings)
     end
@@ -3285,8 +3235,8 @@ end
 
 --- unit -> bool
 save_lookups = function ( )
-    local path    = names.path.lookups
-    local luaname, lucname = path.lua, path.luc
+    local paths = config.luaotfload.paths
+    local luaname, lucname = paths.lookup_path_lua, paths.lookup_path_luc
     if fileiswritable (luaname) and fileiswritable (lucname) then
         tabletofile (luaname, lookup_cache, true)
         osremove (lucname)
@@ -3320,12 +3270,12 @@ save_names = function (currentnames)
     elseif currentnames.meta and currentnames.meta["local"] then
         return false, "table contains local entries"
     end
-    local path = names.path.index
-    local luaname, lucname = path.lua, path.luc
+    local paths = config.luaotfload.paths
+    local luaname, lucname = paths.index_path_lua, paths.index_path_luc
     if fileiswritable (luaname) and fileiswritable (lucname) then
         osremove (lucname)
         local gzname = luaname .. ".gz"
-        if luaotfloadconfig.compress then
+        if config.luaotfload.db.compress then
             local serialized = tableserialize (currentnames, true)
             save_gzipped (gzname, serialized)
             caches.compile (currentnames, "", lucname)
@@ -3443,7 +3393,7 @@ end
 local getwritablecachepath = function ( )
     --- fonts.handlers.otf doesn’t exist outside a Luatex run,
     --- so we have to improvise
-    local writable = getwritablepath (luaotfloadconfig.cache_dir)
+    local writable = getwritablepath (config.luaotfload.paths.cache_dir)
     if writable then
         return writable
     end
@@ -3451,7 +3401,7 @@ end
 
 local getreadablecachepaths = function ( )
     local readables = caches.getreadablepaths
-                        (luaotfloadconfig.cache_dir)
+                        (config.luaotfload.paths.cache_dir)
     local result    = { }
     if readables then
         for i=1, #readables do
@@ -3520,6 +3470,7 @@ names.set_font_filter             = set_font_filter
 names.flush_lookup_cache          = flush_lookup_cache
 names.save_lookups                = save_lookups
 names.load                        = load_names
+names.access_font_index           = access_font_index
 names.data                        = function () return name_index end
 names.save                        = save_names
 names.update                      = update_names
@@ -3528,25 +3479,18 @@ names.crude_file_lookup_verbose   = crude_file_lookup_verbose
 names.read_blacklist              = read_blacklist
 names.sanitize_fontname           = sanitize_fontname
 names.getfilename                 = resolve_fullpath
+names.getmetadata                 = getmetadata
 names.set_location_precedence     = set_location_precedence
 names.count_font_files            = count_font_files
 names.nth_font_filename           = nth_font_filename
 names.font_slice                  = font_slice
+names.resolve_cached              = resolve_cached
+names.resolve_name                = resolve_name
 
 --- font cache
 names.purge_cache    = purge_cache
 names.erase_cache    = erase_cache
 names.show_cache     = show_cache
-
---- replace the resolver from luatex-fonts
-if luaotfloadconfig.resolver == "cached" then
-    report("both", 2, "cache", "Caching of name: lookups active.")
-    names.resolvespec  = resolve_cached
-    names.resolve_name = resolve_cached
-else
-    names.resolvespec  = resolve_name
-    names.resolve_name = resolve_name
-end
 
 names.find_closest = find_closest
 

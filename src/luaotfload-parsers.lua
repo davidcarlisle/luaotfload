@@ -21,6 +21,8 @@ luaotfload              = luaotfload or { }
 luaotfload.parsers      = luaotfload.parsers or { }
 local parsers           = luaotfload.parsers
 
+local rawset            = rawset
+
 local lpeg              = require "lpeg"
 local P, R, S           = lpeg.P, lpeg.R, lpeg.S
 local lpegmatch         = lpeg.match
@@ -39,7 +41,7 @@ local io                = io
 local ioopen            = io.open
 
 local log               = luaotfload.log
-local report            = log.report
+local logreport         = log.report
 
 local string            = string
 local stringsub         = string.sub
@@ -62,14 +64,22 @@ local semicolon         = P";"
 local comma             = P","
 local noncomma          = 1 - comma
 local slash             = P"/"
+local backslash         = P"\\"
 local equals            = P"="
+local dash              = P"-"
+local gartenzaun        = P"#"
 local lbrk, rbrk        = P"[", P"]"
+local squote            = P"'"
+local dquote            = P"\""
 
+local newline           = P"\n"
+local returnchar        = P"\r"
 local spacing           = S" \t\v"
 local linebreak         = S"\n\r"
 local whitespace        = spacing + linebreak
 local ws                = spacing^0
 local xmlws             = whitespace^1
+local eol               = P"\n\r" + P"\r\n" + linebreak
 
 local digit             = R"09"
 local alpha             = R("az", "AZ")
@@ -182,7 +192,7 @@ local p_cheapxml          = header * root
 local fonts_conf_scanner = function (path)
   local fh = ioopen(path, "r")
   if not fh then
-    report("both", 3, "db", "Cannot open fontconfig file %s.", path)
+    logreport("both", 3, "db", "Cannot open fontconfig file %s.", path)
     return
   end
   local raw = fh:read"*all"
@@ -190,7 +200,7 @@ local fonts_conf_scanner = function (path)
 
   local confdata = lpegmatch(p_cheapxml, raw)
   if not confdata then
-    report("both", 3, "db", "Cannot scan fontconfig file %s.", path)
+    logreport("both", 3, "db", "Cannot scan fontconfig file %s.", path)
     return
   end
   return confdata
@@ -346,7 +356,7 @@ parsers.splitcomma      = splitcomma
 
 
 -------------------------------------------------------------------------------
----                          FONT REQUEST
+---                              FONT REQUEST
 -------------------------------------------------------------------------------
 
 
@@ -461,7 +471,7 @@ end
 --doc]]--
 
 local handle_invalid_option = function (opt)
-    report("log", 0, "load", "font option %q unknown.", opt)
+    logreport("log", 0, "load", "font option %q unknown.", opt)
     return "", false
 end
 
@@ -475,12 +485,12 @@ end
 
 local check_garbage = function (_,i, garbage)
     if stringfind(garbage, "/") then
-        report("log", 0, "load",  --- ffs use path!
-            "warning: path in file: lookups is deprecated; ")
-        report("log", 0, "load", "use bracket syntax instead!")
-        report("log", 0, "load",
-            "position: %d; full match: %q",
-            i, garbage)
+        logreport("log", 0, "load",  --- ffs use path!
+                  "warning: path in file: lookups is deprecated; ")
+        logreport("log", 0, "load", "use bracket syntax instead!")
+        logreport("log", 0, "load",
+                  "position: %d; full match: %q",
+                  i, garbage)
         return true
     end
     return false
@@ -583,3 +593,112 @@ local font_request      = Ct(path_lookup   * (colon^-1 * features)^-1
 
 luaotfload.parsers.font_request = font_request
 
+-------------------------------------------------------------------------------
+---                                INI FILES
+-------------------------------------------------------------------------------
+
+--[[doc--
+
+    Luaotfload uses the pervasive flavor of the INI files that allows '#' in
+    addition to ';' to indicate comment lines (see git-config(1) for a
+    description of the syntax we’re targeting).
+
+--doc]]--
+
+local truth_ids = {
+  ["true"]  = true,
+  ["1"]     = true,
+  yes       = true,
+  on        = true,
+  ["false"] = false,
+  ["2"]     = false,
+  no        = false,
+  off       = false,
+}
+
+local maybe_cast = function (var)
+  local bool = truth_ids[var]
+  if bool ~= nil then
+    return bool
+  end
+  return tonumber (var) or var
+end
+local escape = function (chr, repl)
+  return (backslash * P(chr) / (repl or chr))
+end
+local valid_escapes     = escape "\""
+                        + escape "\\"
+                        + escape ("n", "\n")
+                        + escape ("t", "\t")
+                        + escape ("b", "\b")
+local comment_char      = semicolon + gartenzaun
+local comment_line      = ws * comment_char * (1 - eol)^0 * eol
+local blank_line        = ws * eol
+local skip_line         = comment_line + blank_line
+local ini_id_char       = alpha + dash
+local ini_id            = (alpha * ini_id_char^0) / stringlower
+local ini_value_char    = (valid_escapes + (1 - newline - backslash - comment_char))
+local ini_value         = (Cs (ini_value_char^0) / string.strip)
+                        * (comment_char * (1 - eol)^0)^-1
+local ini_string_char   = (valid_escapes + (1 - newline - dquote - backslash))
+local ini_string        = dquote
+                        * Cs (ini_string_char^0)
+                        * dquote
+
+local ini_heading_title = Ct (Cg (ini_id, "title")
+                            * (ws * Cg (ini_string / stringlower, "subtitle"))^-1)
+local ini_heading       = lbrk * ws
+                        * Cg (ini_heading_title, "section")
+                        * ws * rbrk * ws * eol
+
+local ini_variable_full = Cg (ws
+                            * ini_id
+                            * ws
+                            * equals
+                            * ws
+                            * (ini_string + (ini_value / maybe_cast))
+                            * ws
+                            * eol)
+local ini_variable_true = Cg (ws * ini_id * ws * eol * Cc (true))
+local ini_variable      = ini_variable_full
+                        + ini_variable_true
+                        + skip_line
+local ini_variables     = Cg (Cf (Ct "" * ini_variable^0, rawset), "variables")
+
+local ini_section       = Ct (ini_heading * ini_variables)
+local ini_sections      = skip_line^0 * ini_section^0
+local config            = Ct (ini_sections)
+
+--[=[doc--
+
+    The INI parser converts an input of the form
+
+            [==[
+              [foo]
+              bar = baz
+              xyzzy = no
+              buzz
+
+              [lavernica "brutalitops"]
+              # It’s a locomotive that runs on us.
+                laan-ev = zip zop zooey   ; jib-jab
+              Crouton = "Fibrosis \"\\ # "
+
+            ]==]
+
+    to a Lua table of the form
+
+            { { section = { title = "foo" },
+                variables = { bar = "baz",
+                              xyzzy = false,
+                              buzz = true } },
+              { section = { title = "boing",
+                            subtitle = "brutalitops" },
+                variables = { ["laan-ev"] = "zip zop zooey",
+                              crouton = "Fibrosis \"\\ # " } } }
+
+--doc]=]--
+
+luaotfload.parsers.config = config
+
+-- vim:ft=lua:tw=71:et:sts=4:ts=8

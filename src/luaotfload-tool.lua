@@ -6,7 +6,7 @@
 --       AUTHOR:  Khaled Hosny, Élie Roux, Philipp Gesang
 --      VERSION:  2.5
 --      LICENSE:  GPL v2.0
---     MODIFIED:  2014-01-14 13:17:04+0100
+--     MODIFIED:  2014-05-15 21:47:39+0200
 -----------------------------------------------------------------------
 
 luaotfload          = luaotfload or { }
@@ -45,7 +45,6 @@ kpse.set_program_name "luatex"
 --doc]]--
 
 
-local ioopen          = io.open
 local iowrite         = io.write
 local kpsefind_file   = kpse.find_file
 local mathfloor       = math.floor
@@ -90,24 +89,19 @@ string.quoted = string.quoted or function (str)
   return string.format("%q",str) 
 end
 
-require(loader_path)
+require (loader_path)
 
-config                        = config or { }
-local config                  = config
-local luaotfloadconfig        = config.luaotfload or { }
-config.luaotfload             = luaotfloadconfig
-luaotfloadconfig.bisect       = false
-luaotfloadconfig.version      = luaotfloadconfig.version   or version
-luaotfloadconfig.names_dir    = luaotfloadconfig.names_dir or "names"
-luaotfloadconfig.cache_dir    = luaotfloadconfig.cache_dir or "fonts"
-luaotfloadconfig.index_file   = luaotfloadconfig.index_file
-                             or "luaotfload-names.lua"
-luaotfloadconfig.formats      = luaotfloadconfig.formats
-                             or "otf,ttf,ttc,dfont"
-luaotfloadconfig.reload       = false
-if not luaotfloadconfig.strip then
-    luaotfloadconfig.strip = true
-end
+--[[doc--
+
+    XXX:
+        Creating the config table will be moved to the common
+        initialization when the times comes.
+
+--doc]]--
+
+config                          = config or { }
+local config                    = config
+config.luaotfload               = config.luaotfload or { }
 
 config.lualibs                  = config.lualibs or { }
 config.lualibs.verbose          = false
@@ -120,6 +114,7 @@ local lfsisdir                  = lfs.isdir
 local lfsisfile                 = lfs.isfile
 local stringsplit               = string.split
 local tableserialize            = table.serialize
+local tablesortedkeys           = table.sortedkeys
 local tabletohash               = table.tohash
 
 --[[doc--
@@ -148,24 +143,17 @@ require"luaotfload-basics-gen.lua"
 texio.write, texio.write_nl          = backup.write, backup.write_nl
 utilities                            = backup.utilities
 
-require"luaotfload-log.lua"       --- this populates the luaotfload.log.* namespace
-require"luaotfload-parsers"       --- fonts.conf and request syntax
-require"luaotfload-database"
-require"alt_getopt"
+require "luaotfload-log.lua"       --- this populates the luaotfload.log.* namespace
+require "luaotfload-parsers"       --- fonts.conf, configuration, and request syntax
+require "luaotfload-configuration" --- configuration file handling
+require "luaotfload-database"
+require "alt_getopt"
 
 local names                          = fonts.names
-local status_file                    = "luaotfload-status"
-local luaotfloadstatus               = require (status_file)
-luaotfloadconfig.status              = luaotfloadstatus
 local sanitize_fontname              = names.sanitize_fontname
 
 local log                            = luaotfload.log
 local report                         = log.report
-
-local pathdata                       = names.path
-local names_plain                    = pathdata.index.lua
-local names_gzip                     = names_plain .. ".gz"
-local names_bin                      = pathdata.index.luc
 
 local help_messages = {
     ["luaotfload-tool"] = [[
@@ -261,14 +249,17 @@ Enter 'luaotfload-tool --help' for a larger list of options.
 }
 
 local help_msg = function (version)
-    local template = help_messages[version]
+    local template      = help_messages[version]
+    local paths         = config.luaotfload.paths
+    local names_plain   = paths.index_path_lua
+    local names_gzip    = names_plain .. ".gz"
+    local names_bin     = paths.index_path_luc
+
     iowrite(stringformat(template,
                          luaotfload.self,
---                         names_plain,
                          names_gzip,
                          names_bin,
-                         caches.getwritablepath (
-                            luaotfloadconfig.cache_dir)))
+                         caches.getwritablepath (config.luaotfload.cache_dir)))
 end
 
 local about = [[
@@ -279,16 +270,28 @@ local about = [[
 ]]
 
 local version_msg = function ( )
-    local out = function (...) texiowrite_nl (stringformat (...)) end
+    local out   = function (...) texiowrite_nl (stringformat (...)) end
+    local uname = os.uname ()
+    local meta  = names.getmetadata ()
     out (about, luaotfload.self)
-    out ("%s version %q", luaotfload.self, version)
-    out ("revision %q", luaotfloadstatus.notes.revision)
-    out ("database version %q", names.version)
+    out ("%s version: %q", luaotfload.self, version)
+    out ("Revision: %q", config.luaotfload.status.notes.revision)
     out ("Lua interpreter: %s; version %q", runtime[1], runtime[2])
-    out ("Luatex SVN revision %d", status.luatex_svn)
-    out ("Luatex version %.2f.%d",
+    out ("Luatex SVN revision: %d", status.luatex_svn)
+    out ("Luatex version: %.2f.%d",
          status.luatex_version / 100,
          status.luatex_revision)
+    out ("Platform: type=%s name=%s", os.type, os.name)
+
+    local uname_vars = tablesortedkeys (uname)
+    for i = 1, #uname_vars do
+        local var = uname_vars[i]
+        out ("    + %8s: %s", var, uname[var])
+    end
+    out ("Index: version=%q created=%q modified=%q",
+         config.luaotfload.status.notes.revision,
+         meta.created or "ages ago",
+         meta.modified or "ages ago")
     out ""
 end
 
@@ -361,7 +364,7 @@ local baseindent = "    "
 local show_info_table show_info_table = function (t, depth)
     depth           = depth or 0
     local indent    = stringrep (baseindent, depth)
-    local keys      = table.sortedkeys (t)
+    local keys      = tablesortedkeys (t)
     for n = 1, #keys do
         local key = keys [n]
         local val = t [key]
@@ -736,13 +739,14 @@ set.
 --]]--
 
 local action_sequence = {
-    "loglevel",   "help",  "version", "diagnose",
-    "blacklist",  "cache", "flush",   "bisect",
-    "generate",    "list", "query",
+    "loglevel", "config",    "help",  "version",
+    "diagnose", "blacklist", "cache", "flush",
+    "bisect",   "generate",  "list",  "query",
 }
 
 local action_pending  = tabletohash(action_sequence, false)
 
+action_pending.config   = true  --- always read the configuration
 action_pending.loglevel = true  --- always set the loglevel
 action_pending.generate = false --- this is the default action
 
@@ -752,6 +756,20 @@ actions.loglevel = function (job)
     log.set_loglevel(job.log_level)
     report ("info", 3, "util", "Setting log level", "%d", job.log_level)
     report ("log", 2, "util", "Lua=%q", _VERSION)
+    return true, true
+end
+
+actions.config = function (job)
+    local defaults            = luaotfload.default_config
+    local vars                = config.actions.read (job.extra_config)
+    config.luaotfload         = config.actions.apply (defaults, vars)
+    config.luaotfload         = config.actions.apply (config.luaotfload, job.config)
+
+    --inspect(config.luaotfload)
+    --os.exit()
+    if not config.actions.reconfigure () then
+        return false, false
+    end
     return true, true
 end
 
@@ -768,7 +786,7 @@ end
 actions.blacklist = function (job)
     names.read_blacklist()
     local n = 0
-    for n, entry in next, table.sortedkeys(names.blacklist) do
+    for n, entry in next, tablesortedkeys(names.blacklist) do
         iowrite (stringformat("(%d %s)\n", n, entry))
     end
     return true, false
@@ -1054,7 +1072,7 @@ local bisect_run = function ()
             nsteps, lo, hi, pivot)
     report ("info", 1, "bisect", "Step %d: Testing fonts from %d to %d.",
             currentstep, lo, pivot)
-    luaotfloadconfig.bisect = { lo, pivot }
+    config.luaotfload.misc.bisect = { lo, pivot }
     return true, true
 end
 
@@ -1383,11 +1401,13 @@ local process_cmdline = function ( ) -- unit -> jobspec
         query        = "",
         log_level    = 0, --- 2 is approx. the old behavior
         bisect       = nil,
+        config       = { db = { }, misc = { }, run = { }, paths = { } },
     }
 
     local long_options = {
+        ["bisect"]         = 1,
         cache              = 1,
-        ["no-compress"]    = "c",
+        conf               = 1,
         diagnose           = 1,
         ["dry-run"]        = "D",
         ["flush-lookups"]  = "l",
@@ -1404,11 +1424,12 @@ local process_cmdline = function ( ) -- unit -> jobspec
         ["local"]          = "L",
         log                = 1,
         ["max-fonts"]      = 1,
-        ["bisect"]         = 1,
+        ["no-compress"]    = "c",
         ["no-reload"]      = "n",
         ["no-strip"]       = 0,
         ["skip-read"]      = "R",
         ["prefer-texmf"]   = "p",
+        ["print-conf"]     = 0,
         quiet              = "q",
         ["show-blacklist"] = "b",
         stats              = "S",
@@ -1478,7 +1499,7 @@ local process_cmdline = function ( ) -- unit -> jobspec
             action_pending["flush"] = true
         elseif v == "L" then
             action_pending["generate"] = true
-            luaotfloadconfig.scan_local = true
+            config.luaotfload.db.scan_local = true
         elseif v == "list" then
             action_pending["list"] = true
             result.criterion = optarg[n]
@@ -1499,29 +1520,42 @@ local process_cmdline = function ( ) -- unit -> jobspec
             action_pending["diagnose"] = true
             result.asked_diagnostics = optarg[n]
         elseif v == "formats" then
-            names.set_font_filter (optarg[n])
+            result.config.db.formats = optarg[n]
+            --names.set_font_filter (optarg[n])
         elseif v == "n" then
-            luaotfloadconfig.update_live = false
+            config.luaotfload.db.update_live = false
         elseif v == "S" then
-            luaotfloadconfig.statistics = true
+            config.luaotfload.misc.statistics = true
         elseif v == "R" then
             ---  dev only, undocumented
-            luaotfloadconfig.skip_read = true
+            config.luaotfload.db.skip_read = true
         elseif v == "c" then
-            luaotfloadconfig.compress = false
+            config.luaotfload.db.compress = false
         elseif v == "no-strip" then
-            luaotfloadconfig.strip = false
+            config.luaotfload.db.strip = false
         elseif v == "max-fonts" then
             local n = optarg[n]
             if n then
                 n = tonumber(n)
                 if n and n > 0 then
-                    luaotfloadconfig.max_fonts = n
+                    config.luaotfload.db.max_fonts = n
                 end
             end
         elseif v == "bisect" then
-            result.bisect          = optarg[n]
+            result.bisect         = optarg[n]
             action_pending.bisect = true
+        elseif v == "conf" then
+            local extra = stringexplode (optarg[n], ",+")
+            if extra then
+                local extra_config = result.extra_config
+                if extra_config then
+                    table.append (extra_config, extra)
+                else
+                    result.extra_config = extra
+                end
+            end
+        elseif v == "print-conf" then
+            result.print_config = true
         end
     end
 
