@@ -478,8 +478,7 @@ fonts.encodings.known     = fonts.encodings.known or { }
 
 --doc]]--
 
---local resolve_file        = names.crude_file_lookup
-local resolve_file        = names.crude_file_lookup_verbose
+local resolve_file        = names.font_file_lookup
 
 local file_resolver = function (specification)
     local name    = resolve_file (specification.name)
@@ -626,8 +625,10 @@ request_resolvers.name = function (specification)
     end
     local resolved, subfont = resolver (specification)
     if resolved then
-        report ("log", 0, "load", "Lookup/name: %q -> \"%s(%d)\"",
-                specification.name, resolved, subfont)
+        report ("log", 0, "load", "Lookup/name: %q -> \"%s%s\"",
+                specification.name,
+                resolved,
+                subfont and stringformat ("(%d)", subfont) or "")
         specification.resolved   = resolved
         specification.sub        = subfont
         specification.forced     = stringlower (filesuffix (resolved) or "")
