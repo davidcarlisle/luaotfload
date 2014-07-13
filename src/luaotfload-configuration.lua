@@ -27,6 +27,7 @@ local luaotfloadstatus        = require (status_file)
 local string                  = string
 local stringsub               = string.sub
 local stringexplode           = string.explode
+local stringstrip             = string.strip
 
 local table                   = table
 local tableappend             = table.append
@@ -106,7 +107,6 @@ local valid_formats = tabletohash {
 local default_config = {
   db = {
     formats     = "otf,ttf,ttc,dfont",
-    reload      = false,
     scan_local  = false,
     skip_read   = false,
     strip       = true,
@@ -278,7 +278,7 @@ local option_spec = {
         local known  = { }
         local result = { }
         for i = 1, #fields do
-          local field = fields[i]
+          local field = stringstrip (fields[i])
           if known[field] ~= true then
             --- yet unknown, tag as seen
             known[field] = true
@@ -287,7 +287,8 @@ local option_spec = {
               result[#result + 1] = field
             else
               logreport ("both", 4, "conf",
-                          "Invalid font format identifier %q, ignoring.", field)
+                         "Invalid font format identifier %q, ignoring.",
+                         field)
             end
           end
         end
@@ -298,7 +299,6 @@ local option_spec = {
         return tableconcat (result, ",")
       end
     },
-    reload       = { in_t = boolean_t, },
     scan_local   = { in_t = boolean_t, },
     skip_read    = { in_t = boolean_t, },
     strip        = { in_t = boolean_t, },
@@ -446,7 +446,12 @@ local process_options = function (opts)
         for var, val in next, vars do
           local vspec = spec[var]
           local t_val = type (val)
-          if t_val ~= vspec.in_t then
+          if not vspec then
+            logreport ("both", 0, "conf",
+                       "Section %d (%s): invalid configuration variable %q (%q); ignoring.",
+                       i, title,
+                       var, tostring (val))
+          elseif t_val ~= vspec.in_t then
             logreport ("both", 2, "conf",
                        "Section %d (%s): type mismatch of input value %q (%q, %s != %s); ignoring.",
                        i, title,
